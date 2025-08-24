@@ -1,115 +1,136 @@
-import pandas as pd  # Data manipulation
-from sklearn.model_selection import train_test_split  # Split data for training
-from sklearn.linear_model import LogisticRegression  # Logistic Regression model
-from sklearn.metrics import accuracy_score  # Model evaluation
-import warnings  # Suppress warnings
+"""
+Este script processa dados de clientes e eventos para prever a probabilidade
+de interesse do cliente em determinados eventos. 
+Ele calcula histórico de visitas por estado, adiciona features temporais
+e de viagem, treina um modelo de Regressão Logística (ou usa probabilidade histórica)
+e exporta as predições em CSV.
+"""
 
-warnings.filterwarnings("ignore")  # Ignore warnings
+# ----------------- Imports -----------------
+import pandas as pd  # Manipulação de DataFrames
+from sklearn.model_selection import train_test_split  # Divisão de dados em treino/teste
+from sklearn.linear_model import LogisticRegression  # Modelo de Regressão Logística
+from sklearn.metrics import accuracy_score  # Avaliação de acurácia
+import warnings  # Controle de avisos
 
+warnings.filterwarnings("ignore")  # Ignora avisos não críticos
 
-def load_data(path_clients, path_events):
-    """Load client and event CSVs."""
-    df_clients = pd.read_csv(path_clients, low_memory=False)  # Read clients CSV
-    df_clients['DATA_COMPRA'] = pd.to_datetime(df_clients['DATA_COMPRA'])  # Convert purchase date
-    df_clients['DATA_CADASTRO'] = pd.to_datetime(df_clients['DATA_CADASTRO'])  # Convert registration date
+# ----------------- 1) Leitura de dados -----------------
+PATH_CLIENTES = "resources/travel_data_export.csv"  # CSV de clientes
+PATH_EVENTOS = "resources/eventos.csv"  # CSV de eventos
+OUTPUT_PATH = "predicoes_eventos.csv"  # Caminho de saída
 
-    df_events = pd.read_csv(path_events, low_memory=False)  # Read events CSV
-    df_events['Data'] = pd.to_datetime(df_events['Data'], dayfirst=True)  # Convert event date
-    return df_clients, df_events  # Return both DataFrames
+# Lê CSV de clientes
+df_clients = pd.read_csv(PATH_CLIENTES, low_memory=False)
+# Converte colunas de datas
+df_clients['DATA_COMPRA'] = pd.to_datetime(df_clients['DATA_COMPRA'])
+df_clients['DATA_CADASTRO'] = pd.to_datetime(df_clients['DATA_CADASTRO'])
 
+# Lê CSV de eventos
+df_events = pd.read_csv(PATH_EVENTOS, low_memory=False)
+# Converte coluna de data do evento (dia primeiro)
+df_events['Data'] = pd.to_datetime(df_events['Data'], dayfirst=True)
 
-def build_client_state(df_clients):
-    """Extract unique client-state pairs."""
-    estado_cols = ['ESTADO_IDA_ORIGEM', 'ESTADO_IDA_DESTINO', 'ESTADO_RETORNO_ORIGEM', 'ESTADO_RETORNO_DESTINO']
-    # Combine all state columns into one DataFrame
-    df_states = pd.concat([df_clients[['EMAIL_CLIENTE', col]].rename(columns={col: 'Estado'}) for col in estado_cols])
-    return df_states.dropna().drop_duplicates()  # Drop missing and duplicate pairs
+# ----------------- 2) Construção de pares cliente-estado -----------------
+# Colunas de estado para análise
+estado_cols = ['ESTADO_IDA_ORIGEM', 'ESTADO_IDA_DESTINO', 'ESTADO_RETORNO_ORIGEM', 'ESTADO_RETORNO_DESTINO']
 
+# Concatena todas as colunas de estado em um DataFrame único
+df_states = pd.concat([
+    df_clients[['EMAIL_CLIENTE', col]].rename(columns={col: 'Estado'}) 
+    for col in estado_cols
+])
+# Remove duplicados e valores nulos
+df_states = df_states.dropna().drop_duplicates()
 
-def compute_history(df_states):
-    """Compute visits per client-state and normalized probability."""
-    df_hist = df_states.groupby(['EMAIL_CLIENTE', 'Estado']).size().reset_index(name='visitas_estado')  # Count visits
-    df_total = df_states.groupby('EMAIL_CLIENTE').size().reset_index(name='total_visitas')  # Total visits per client
-    df_hist = df_hist.merge(df_total, on='EMAIL_CLIENTE', how='left')  # Merge totals
-    df_hist['prob_historica'] = df_hist['visitas_estado'] / df_hist['total_visitas']  # Normalize probability
-    return df_hist  # Return history DataFrame
+# ----------------- 3) Histórico de visitas -----------------
+# Conta visitas de cada cliente a cada estado
+df_hist = df_states.groupby(['EMAIL_CLIENTE', 'Estado']).size().reset_index(name='visitas_estado')
+# Conta total de visitas por cliente
+df_total = df_states.groupby('EMAIL_CLIENTE').size().reset_index(name='total_visitas')
+# Junta totais ao histórico
+df_hist = df_hist.merge(df_total, on='EMAIL_CLIENTE', how='left')
+# Calcula probabilidade histórica (visitas a um estado / total de visitas)
+df_hist['prob_historica'] = df_hist['visitas_estado'] / df_hist['total_visitas']
 
+# ----------------- 4) Merge histórico com eventos -----------------
+# Combina histórico com os eventos
+df_analise = df_hist.merge(df_events, left_on='Estado', right_on='Estado', how='right')
+# Preenche NaN com zero (clientes que nunca visitaram)
+df_analise[['visitas_estado', 'total_visitas', 'prob_historica']] = df_analise[
+    ['visitas_estado', 'total_visitas', 'prob_historica']].fillna(0)
 
-def prepare_features(df_analise, df_clients):
-    """Add features for modeling."""
-    df_last = df_clients.groupby("EMAIL_CLIENTE")['DATA_COMPRA'].max().reset_index()  # Last purchase date
-    df_analise = df_analise.merge(df_last, on="EMAIL_CLIENTE", how="left")  # Merge with analysis
-    df_analise['dias_para_evento'] = (df_analise['Data'] - df_analise['DATA_COMPRA']).dt.days  # Days to event
+# ----------------- 5) Features temporais -----------------
+# Última compra do cliente
+df_last = df_clients.groupby("EMAIL_CLIENTE")['DATA_COMPRA'].max().reset_index()
+# Merge com df_analise
+df_analise = df_analise.merge(df_last, on="EMAIL_CLIENTE", how="left")
+# Dias até o evento
+df_analise['dias_para_evento'] = (df_analise['Data'] - df_analise['DATA_COMPRA']).dt.days
 
-    df_last_state = df_clients.groupby("EMAIL_CLIENTE").last().reset_index()
-    df_last_state = df_last_state[['EMAIL_CLIENTE', 'ESTADO_IDA_ORIGEM']].rename(
-        columns={'ESTADO_IDA_ORIGEM': 'ESTADO_CLIENTE'})  # Last origin state
-    df_analise = df_analise.merge(df_last_state, on="EMAIL_CLIENTE", how="left")  # Merge client state
-    df_analise['cliente_mora_no_estado_evento'] = (df_analise['ESTADO_CLIENTE'] == df_analise['Estado']).astype(
-        int)  # Same state flag
+# Último estado do cliente (origem)
+df_last_state = df_clients.groupby("EMAIL_CLIENTE").last().reset_index()
+df_last_state = df_last_state[['EMAIL_CLIENTE', 'ESTADO_IDA_ORIGEM']].rename(
+    columns={'ESTADO_IDA_ORIGEM': 'ESTADO_CLIENTE'})
+df_analise = df_analise.merge(df_last_state, on="EMAIL_CLIENTE", how="left")
+# Flag se cliente mora no estado do evento
+df_analise['cliente_mora_no_estado_evento'] = (df_analise['ESTADO_CLIENTE'] == df_analise['Estado']).astype(int)
 
-    df_last_trip = df_clients.groupby('EMAIL_CLIENTE').last().reset_index()
-    df_last_trip = df_last_trip[['EMAIL_CLIENTE', 'VALOR_TOTAL_PASSAGEM', 'QUANTIDADE_PASSAGENS']]  # Last trip info
-    df_analise = df_analise.merge(df_last_trip, on='EMAIL_CLIENTE', how='left')  # Merge trip info
+# Última viagem do cliente
+df_last_trip = df_clients.groupby('EMAIL_CLIENTE').last().reset_index()
+df_last_trip = df_last_trip[['EMAIL_CLIENTE', 'VALOR_TOTAL_PASSAGEM', 'QUANTIDADE_PASSAGENS']]
+df_analise = df_analise.merge(df_last_trip, on='EMAIL_CLIENTE', how='left')
 
-    df_hist = df_clients.groupby("EMAIL_CLIENTE").agg(
-        compras_historicas=('EMAIL_CLIENTE', 'count'),  # Total purchases
-        valor_medio_historico=('VALOR_TOTAL_PASSAGEM', 'mean')  # Avg ticket value
-    ).reset_index()
-    df_analise = df_analise.merge(df_hist, on="EMAIL_CLIENTE", how="left")  # Merge history
+# Histórico agregado de compras
+df_hist = df_clients.groupby("EMAIL_CLIENTE").agg(
+    compras_historicas=('EMAIL_CLIENTE', 'count'),
+    valor_medio_historico=('VALOR_TOTAL_PASSAGEM', 'mean')
+).reset_index()
+df_analise = df_analise.merge(df_hist, on="EMAIL_CLIENTE", how="left")
 
-    return df_analise  # Return enriched DataFrame
+# ----------------- 6) Definição do target -----------------
+# Target = 1 se cliente já visitou o estado pelo menos uma vez
+df_analise['target'] = (df_analise['visitas_estado'] > 0).astype(int)
 
+# ----------------- 7) Features do modelo -----------------
+features = [
+    'dias_para_evento',
+    'cliente_mora_no_estado_evento',
+    'VALOR_TOTAL_PASSAGEM',
+    'QUANTIDADE_PASSAGENS',
+    'compras_historicas',
+    'valor_medio_historico'
+]
 
-def train_model(df, features, target='target'):
-    """Train Logistic Regression if 2 classes exist, else return None."""
-    df_model = df.dropna(subset=features)  # Drop rows with missing features
-    X, y = df_model[features], df_model[target]  # Split features and target
+# ----------------- 8) Treinamento do modelo -----------------
+# Remove linhas com valores ausentes nas features
+df_model = df_analise.dropna(subset=features)
+X, y = df_model[features], df_model['target']
 
-    if y.nunique() < 2:  # Check if only one class
-        print("Only one class detected, using historical probability as fallback.")
-        return None
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)  # Split data
-    model = LogisticRegression(random_state=42, solver='liblinear')  # Initialize model
-    model.fit(X_train, y_train)  # Train model
-    print(f"Model accuracy: {accuracy_score(y_test, model.predict(X_test)):.2f}")  # Print accuracy
-    return model  # Return trained model
+# Se houver apenas uma classe, não treina modelo
+if y.nunique() < 2:
+    print("Apenas uma classe detectada. Usando probabilidade histórica como fallback.")
+    model = None
+else:
+    # Divisão treino/teste
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    # Inicializa Regressão Logística
+    model = LogisticRegression(random_state=42, solver='liblinear')
+    model.fit(X_train, y_train)  # Treina o modelo
+    print(f"Acurácia do modelo: {accuracy_score(y_test, model.predict(X_test)):.2f}")
 
+# ----------------- 9) Predição de probabilidades -----------------
+if model is None:
+    # Fallback para probabilidade histórica
+    df_analise['probabilidade_evento'] = df_analise['prob_historica']
+else:
+    # Probabilidade prevista pelo modelo
+    df_analise['probabilidade_evento'] = model.predict_proba(df_analise[features].fillna(0))[:, 1]
 
-def predict_probability(df, model, features):
-    """Compute event probability per client."""
-    if model is None:  # Fallback to historical probability
-        df['probabilidade_evento'] = df['prob_historica']
-    else:
-        df['probabilidade_evento'] = model.predict_proba(df[features].fillna(0))[:, 1]  # Predict probability
-    return df  # Return DataFrame with probability
-
-
-# ----------------- Main -----------------
-if __name__ == "__main__":
-    PATH_CLIENTES = "resources/travel_data_export.csv"  # Client CSV
-    PATH_EVENTOS = "resources/eventos.csv"  # Event CSV
-    OUTPUT_PATH = "predicoes_eventos.csv"  # Output CSV
-
-    df_clients, df_events = load_data(PATH_CLIENTES, PATH_EVENTOS)  # Load data
-    df_states = build_client_state(df_clients)  # Build client-state table
-    df_hist = compute_history(df_states)  # Compute historical visits
-
-    df_analise = df_hist.merge(df_events, left_on='Estado', right_on='Estado', how='right')  # Merge with events
-    df_analise[['visitas_estado', 'total_visitas', 'prob_historica']] = df_analise[
-        ['visitas_estado', 'total_visitas', 'prob_historica']].fillna(0)  # Fill missing
-
-    df_analise = prepare_features(df_analise, df_clients)  # Add features
-
-    df_analise['target'] = (df_analise['visitas_estado'] > 0).astype(int)  # Target: visited state at least once
-
-    features = ['dias_para_evento', 'cliente_mora_no_estado_evento', 'VALOR_TOTAL_PASSAGEM',
-                'QUANTIDADE_PASSAGENS', 'compras_historicas', 'valor_medio_historico']  # Model features
-
-    model = train_model(df_analise, features)  # Train model
-    df_analise = predict_probability(df_analise, model, features)  # Predict probabilities
-
-    df_final = df_analise[['EMAIL_CLIENTE', 'probabilidade_evento', 'Evento', 'Data', 'Cidade']].sort_values(
-        'probabilidade_evento', ascending=False)  # Final selection
-    df_final.to_csv(OUTPUT_PATH, index=False)  # Save CSV
-    print(f"Predictions saved to {OUTPUT_PATH}")  # Confirmation
+# ----------------- 10) Seleção final e exportação -----------------
+# Seleciona colunas relevantes e ordena por probabilidade decrescente
+df_final = df_analise[['EMAIL_CLIENTE', 'probabilidade_evento', 'Evento', 'Data', 'Cidade']].sort_values(
+    'probabilidade_evento', ascending=False)
+# Salva CSV
+df_final.to_csv(OUTPUT_PATH, index=False)
+print(f"Predictions saved to {OUTPUT_PATH}")
